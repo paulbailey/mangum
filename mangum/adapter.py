@@ -107,13 +107,16 @@ class Mangum:
         else:
             source_ip = event["requestContext"].get("identity", {}).get("sourceIp")
             multi_value_query_string_params = event["multiValueQueryStringParameters"]
-            query_string = (
-                urllib.parse.urlencode(
-                    multi_value_query_string_params, doseq=True
+            if "multiValueQueryStringParameters" in event:
+                query_string = urllib.parse.urlencode(
+                    event["multiValueQueryStringParameters"], doseq=True
                 ).encode()
-                if multi_value_query_string_params
-                else b""
-            )
+            elif "queryStringParameters" in event:
+                query_string = urllib.parse.urlencode(
+                    event["queryStringParameters"]
+                ).encode()
+            else:
+                query_string = b""
             path = event["path"]
             http_method = event["httpMethod"]
 
