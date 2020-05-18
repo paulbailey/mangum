@@ -7,9 +7,24 @@ import logging
 from dataclasses import dataclass, field
 
 from mangum.types import ASGIApp, Message, Scope
+from mangum.exceptions import UnexpectedMessage
 
 
 class HTTPCycleState(enum.Enum):
+    """
+    The state of the ASGI `http` connection.
+
+    * **REQUEST** - Initial state. The ASGI application instance will be run with the
+    connection scope containing the `http` type.
+    * **RESPONSE** - The `http.response.start` event has been sent by the application.
+    The next expected message is the `http.response.body` event, containing the body
+    content. An application may pass the `more_body` argument to send content in chunks,
+    however content will always be returned in a single response, never streamed.
+    * **COMPLETE** - The body content from the ASGI application has been completely
+    read. A disconnect event will be sent to the application, and the response will
+    be returned.
+    """
+
     REQUEST = enum.auto()
     RESPONSE = enum.auto()
     COMPLETE = enum.auto()
@@ -17,22 +32,39 @@ class HTTPCycleState(enum.Enum):
 
 @dataclass
 class HTTPCycle:
+    """
+    Manages the application cycle for an ASGI `http` connection.
+
+    * **scope** - A dictionary containing the connection scope used to run the ASGI
+    application instance.
+    * **body** -  A byte string containing the body content of the request.
+    * **text_mime_types** - A list of mime types of MIME types that should not return
+    a binary response in API Gateway.
+    * **state** - An enumerated `HTTPCycleState` type that indicates the state of the
+    ASGI connection.
+    * **app_queue** - An asyncio queue (FIFO) containing messages to be received by the
+    application.
+    * **response** - A dictionary containing the response data to return in AWS Lambda.
+    """
 
     scope: Scope
+    body: bytes
     text_mime_types: typing.List[str]
-    log_level: str
     state: HTTPCycleState = HTTPCycleState.REQUEST
-    body: bytes = b""
     response: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.logger: logging.Logger = logging.getLogger("mangum.asgi.http")
+        self.logger: logging.Logger = logging.getLogger("mangum.http")
         self.loop = asyncio.get_event_loop()
         self.app_queue: asyncio.Queue = asyncio.Queue()
         self.response["isBase64Encoded"] = False
-        self.logger.debug("HTTP cycle initialized!")
 
     def __call__(self, app: ASGIApp) -> dict:
+        self.logger.debug("HTTP cycle starting.")
+        self.app_queue.put_nowait(
+            {"type": "http.request", "body": self.body, "more_body": False}
+        )
+        self.body = b""
         asgi_instance = self.run(app)
         asgi_task = self.loop.create_task(asgi_instance)
         self.loop.run_until_complete(asgi_task)
@@ -40,10 +72,13 @@ class HTTPCycle:
         return self.response
 
     async def run(self, app: ASGIApp) -> None:
+        """
+        Calls the application with the `http` connection scope.
+        """
         try:
             await app(self.scope, self.receive, self.send)
         except BaseException as exc:
-            self.logger.error("Exception in ASGI application", exc_info=exc)
+            self.logger.error("Exception in 'http' protocol.", exc_info=exc)
             if self.state is HTTPCycleState.REQUEST:
                 await self.send(
                     {
@@ -55,41 +90,41 @@ class HTTPCycle:
                 await self.send(
                     {"type": "http.response.body", "body": b"Internal Server Error"}
                 )
-                self.state = HTTPCycleState.COMPLETE
-
             elif self.state is not HTTPCycleState.COMPLETE:
                 self.response["statusCode"] = 500
                 self.response["body"] = "Internal Server Error"
                 self.response["headers"] = {"content-type": "text/plain; charset=utf-8"}
 
     async def receive(self) -> Message:
-        message = await self.app_queue.get()
+        """
+        Awaited by the application to receive ASGI `http` events.
+        """
 
-        return message
+        return await self.app_queue.get()
 
     async def send(self, message: Message) -> None:
-        self.logger.debug("New message event %s received.", message["type"])
-        if self.state is HTTPCycleState.REQUEST:
-            if message["type"] != "http.response.start":
-                raise RuntimeError(
-                    f"Expected 'http.response.start', received: {message['type']}"
-                )
+        """
+        Awaited by the application to send ASGI `http` events.
+        """
+        message_type = message["type"]
+        self.logger.info(
+            "%s:  '%s' event received from application.", self.state, message_type
+        )
 
-            status_code = message["status"]
-            headers = {k: v for k, v in message.get("headers", [])}
-            self.response["statusCode"] = status_code
-
+        if (
+            self.state is HTTPCycleState.REQUEST
+            and message_type == "http.response.start"
+        ):
+            self.response["statusCode"] = message["status"]
             self.response["headers"] = {
-                k.decode(): v.decode() for k, v in headers.items()
+                k.decode().lower(): v.decode() for k, v in message.get("headers", [])
             }
             self.state = HTTPCycleState.RESPONSE
 
-        elif self.state is HTTPCycleState.RESPONSE:
-            if message["type"] != "http.response.body":
-                raise RuntimeError(
-                    f"Expected 'http.response.body', received: {message['type']}"
-                )
-
+        elif (
+            self.state is HTTPCycleState.RESPONSE
+            and message_type == "http.response.body"
+        ):
             body = message.get("body", b"")
             more_body = message.get("more_body", False)
 
@@ -101,17 +136,21 @@ class HTTPCycle:
                 mimetype, _ = cgi.parse_header(
                     self.response["headers"].get("content-type", "text/plain")
                 )
-                response_is_binary = (
+
+                # Check if a binary response should be returned based on the mime type
+                # or content encoding.
+                if (
                     mimetype not in self.text_mime_types
                     and not mimetype.startswith("text/")
-                ) or self.response["headers"].get("content-encoding") == "gzip"
-                if response_is_binary:
+                ) or self.response["headers"].get("content-encoding") == "gzip":
                     body = base64.b64encode(body)
                     self.response["isBase64Encoded"] = True
 
                 self.response["body"] = body.decode()
-                self.put_message({"type": "http.disconnect"})
                 self.state = HTTPCycleState.COMPLETE
+                await self.app_queue.put({"type": "http.disconnect"})
 
-    def put_message(self, message: Message) -> None:
-        self.app_queue.put_nowait(message)
+        else:
+            raise UnexpectedMessage(
+                f"{self.state}: Unexpected '{message_type}' event received."
+            )
